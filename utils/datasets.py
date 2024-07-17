@@ -61,7 +61,7 @@ def collate_fn(batch):
     return torch.stack(img), torch.cat(label, 0)
 
 class TensorDataset():
-    def __init__(self, path, img_width, img_height, aug=False):
+    def __init__(self, path, img_width, img_height, aug=False,label_flag="coco_80"):
         assert os.path.exists(path), "%s文件路径错误或不存在" % path
 
         self.aug = aug
@@ -70,26 +70,39 @@ class TensorDataset():
         self.img_width = img_width
         self.img_height = img_height
         self.img_formats = ['bmp', 'jpg', 'jpeg', 'png']
+        self.cache=False
 
         # 数据检查
         with open(self.path, 'r') as f:
             for line in f.readlines():
                 data_path = line.strip()
+                if not os.path.isabs(data_path):
+                    data_path = os.path.join(os.path.split(self.path)[0], data_path)
                 if os.path.exists(data_path):
                     img_type = data_path.split(".")[-1]
                     if img_type not in self.img_formats:
                         raise Exception("img type error:%s" % img_type)
                     else:
-                        self.data_list.append(data_path)
+                        label_path = os.path.splitext(data_path)[0] + ".txt"
+                        if os.path.exists(label_path):
+                            # img = cv2.imread(data_path)
+                            self.data_list.append((data_path, label_path))
+                        else:
+                            # if not self.aug:
+                            #     label_flag="coco_80"
+                            label_path=label_path.replace("images",label_flag)
+                            if os.path.exists(label_path):
+                                # img = cv2.imread(data_path)
+                                self.data_list.append((data_path, label_path))
+                            else:
+                                raise Exception("%s is not exist" % label_path)
                 else:
                     raise Exception("%s is not exist" % data_path)
 
     def __getitem__(self, index):
-        img_path = self.data_list[index]
-        label_path = img_path.split(".")[0] + ".txt"
+        img_path, label_path = self.data_list[index]
+        img_path_c = img_path.replace("images", "cache")
 
-        # 加载图片
-        img = cv2.imread(img_path)
         # 加载label文件
         if os.path.exists(label_path):
             label = []
@@ -104,16 +117,32 @@ class TensorDataset():
                 #assert (label >= 0).all(), 'negative labels: %s'%label_path
                 #assert (label[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s'%label_path
         else:
-            raise Exception("%s is not exist" % label_path) 
+            raise Exception("%s is not exist" % label_path)
 
-        # 是否进行数据增强
-        if self.aug:
-            if random.randint(1, 10) % 2 == 0:
-                img, label = random_narrow(img, label)
+        # 加载图片
+        if  self.cache:
+            if os.path.exists(img_path_c):
+                img = cv2.imread(img_path_c)
             else:
-                img, label = random_crop(img, label)
-
-        img = cv2.resize(img, (self.img_width, self.img_height), interpolation = cv2.INTER_LINEAR) 
+                img = cv2.imread(img_path)
+                # 是否进行数据增强
+                if self.aug :
+                    if random.randint(1, 10) % 2 == 0:
+                        img, label = random_narrow(img, label)
+                    else:
+                        img, label = random_crop(img, label)
+                img = cv2.resize(img, (self.img_width, self.img_height), interpolation=cv2.INTER_LINEAR)
+                cv2.imwrite(img_path_c, img)
+        else:
+            img = cv2.imread(img_path)
+            # 是否进行数据增强
+            if self.aug:
+                if random.randint(1, 10) % 2 == 0:
+                    img, label = random_narrow(img, label)
+                else:
+                    img, label = random_crop(img, label)
+            img = cv2.resize(img, (self.img_width, self.img_height), interpolation=cv2.INTER_LINEAR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # debug
         # for box in label:

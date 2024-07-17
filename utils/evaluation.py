@@ -7,12 +7,14 @@ from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
 class CocoDetectionEvaluator():
-    def __init__(self, names, device):
+    def __init__(self, names, device,cfg,norm=True):
         self.device = device
         self.classes = []
+        self.cfg=cfg
         with open(names, 'r') as f:
             for line in f.readlines():
                 self.classes.append(line.strip())
+        self.norm=norm
     
     def coco_evaluate(self, gts, preds):
         # Create Ground Truth
@@ -43,7 +45,7 @@ class CocoDetectionEvaluator():
             for j in range(pred.shape[0]):
                 k += 1
                 coco_pred.dataset["images"].append({"id": i})
-                coco_pred.dataset["annotations"].append({"image_id": i, "category_id": np.int(pred[j, 0]),
+                coco_pred.dataset["annotations"].append({"image_id": i, "category_id": int(pred[j, 0]),
                                                         "score": pred[j, 1], "bbox": np.hstack([pred[j, 2:4], pred[j, 4:6] - pred[j, 2:4]]),
                                                         "area": np.prod(pred[j, 4:6] - pred[j, 2:4]),
                                                         "id": k})
@@ -52,13 +54,51 @@ class CocoDetectionEvaluator():
         coco_pred.createIndex()
 
         coco_eval = COCOeval(coco_gt, coco_pred, "bbox")
+        coco_eval.params.iouThrs = np.linspace(self.cfg.iou, 0.95, int(np.round((0.95 - .4) / .05)) + 1, endpoint=True)
         coco_eval.evaluate()
         coco_eval.accumulate()
         coco_eval.summarize()
         mAP05 = coco_eval.stats[1]
+
+        # 过gt和pred计算每个类别的recall
+        precisions = coco_eval.eval['precision']  # TP/(TP+FP) right/detection
+        recalls = coco_eval.eval['recall']  # iou*class_num*Areas*Max_det TP/(TP+FN) right/gt
+        print(
+            '\nIOU:{} MAP:{:.4f} Recall:{:.4f}'.format(coco_eval.params.iouThrs[0], np.mean(precisions[0, :, :, 0, -1]),
+                                                       np.mean(recalls[0, :, 0, -1])))
+        # Compute per-category AP
+        # from https://github.com/facebookresearch/detectron2/
+        # precision: (iou, recall, cls, area range, max dets)
+        results_per_category = []
+        results_per_category_ = []
+        for idx, catId in enumerate(range(len(self.classes))):
+            name = self.classes[idx]
+            precision = precisions[:, :, idx, 0, -1]
+            precision_ = precisions[0, :, idx, 0, -1]
+            precision = precision[precision > -1]
+
+            recall = recalls[:, idx, 0, -1]
+            recall_ = recalls[0, idx, 0, -1]
+            recall = recall[recall > -1]
+
+            if precision.size:
+                ap = np.mean(precision)
+                ap_ = np.mean(precision_)
+                rec = np.mean(recall)
+                rec_ = np.mean(recall_)
+            else:
+                ap = float('nan')
+                ap_ = float('nan')
+                rec = float('nan')
+                rec_ = float('nan')
+            res_item = [f'{name}', f'{float(ap):0.4f}', f'{float(rec):0.4f}']
+            results_per_category.append(res_item)
+            res_item_ = [f'{name}', f'{float(ap_):0.4f}', f'{float(rec_):0.4f}']
+            results_per_category_.append(res_item_)
+        print(results_per_category_)
         return mAP05
 
-    def compute_map(self, val_dataloader, model):
+    def compute_map(self, val_dataloader, model,cfg):
         gts, pts = [], []
         pbar = tqdm(val_dataloader)
         for i, (imgs, targets) in enumerate(pbar):
@@ -68,7 +108,7 @@ class CocoDetectionEvaluator():
                 # 模型预测
                 preds = model(imgs)
                 # 特征图后处理
-                output = handle_preds(preds, self.device, 0.001)
+                output = handle_preds(preds, self.device,0.001, cfg=cfg,norm=self.norm)
 
             # 检测结果
             N, _, H, W = imgs.shape
