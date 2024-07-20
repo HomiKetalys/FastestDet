@@ -4,6 +4,10 @@ import torch
 import torch.nn as nn
 
 from torch.nn import functional as F
+from ultralytics.utils.loss import TaskAlignedAssigner, BboxLoss
+from ultralytics.utils.metrics import bbox_iou
+from ultralytics.utils.tal import make_anchors
+
 
 class DetectorLoss(nn.Module):
     def __init__(self, device):
@@ -159,18 +163,92 @@ class DetectorLoss(nn.Module):
 
 
 class v10DetectorLoss(DetectorLoss):
-    def __init__(self, device, reg_max=17, reg_scale=0.5):
+    def __init__(self, device, nc=80,reg_max=17, reg_scale=0.5,use_taa=False,img_s=(320,320)):
         super(v10DetectorLoss, self).__init__(device)
         self.reg_max = reg_max
         self.reg_scale = reg_scale
-        self.proj = torch.arange(self.reg_max, dtype=torch.float, device=device)
+        if reg_max>1:
+            self.proj = torch.arange(self.reg_max, dtype=torch.float, device=device)
+        self.use_taa=use_taa
+        self.fwd=self.forward_
+        if self.use_taa:
+            self.assigner = TaskAlignedAssigner(topk=10,num_classes=nc)
+            self.bce = nn.BCEWithLogitsLoss(reduction="none")
+            self.fwd=self.forward_v8
+        self.img_s=torch.tensor((img_s[1],img_s[0],img_s[1],img_s[0]),device=device)
+
+
+    def forward_v8(self,preds,targets):
+        # 初始化loss值
+        ft = functools.partial(torch.tensor, device=preds.device)
+        cls_loss, iou_loss, obj_loss, dfl_loss = ft([0.]), ft([0.]), ft([0.]), ft([0.])
+        bs, ch, h, w = preds.shape
+        pred = preds.permute(0, 2, 3, 1).view(bs,-1,ch)
+        stride=self.img_s[1]/h
+
+        # 检测框回归分支
+        preg = pred[:, :, 1:(1 + 4 * self.reg_max)]
+        # 目标类别分类分支
+        pcls = pred[:, :, (1 + 4 * self.reg_max):]
+
+        anchor_points = make_anchors([preds], [stride], 0.5)[0]
+        ptbox = torch.ones((*preg.shape[:2],4), device=self.device)
+        ptbox_dist=None
+        if self.reg_max==1:
+            ptbox[:,:,0:2] = (preg[:,:, 0:2].tanh() + anchor_points)*stride
+            ptbox[:,:,2:4] =preg[:,: ,2:4].sigmoid() * self.img_s[:2]
+            ptbox[:, :, 0:2] -= ptbox[:,:,2:4]*0.5
+            ptbox[:, :, 2:4] += ptbox[:, :, 0:2]
+        else:
+            ptbox_dist=preg.view(bs,-1, 4, self.reg_max).softmax(3)
+            pred_ltrb = ptbox_dist.matmul(self.proj)
+            # x1 = gx - pred_dis[:, 0] / 2
+            # y1 = gy - pred_dis[:, 1] / 2
+            # x2 = gx + pred_dis[:, 2] / 2
+            # y2 = gy + pred_dis[:, 3] / 2
+            ptbox[:, :,0:2] = (anchor_points  - pred_ltrb[:,:, 0:2]*self.reg_scale)*stride
+            ptbox[:,:, 2:4] = (anchor_points + pred_ltrb[:,:, 2:4]* self.reg_scale)*stride
+
+        gtbox=targets[:,:,2:]
+        gtbox[:,:,0:2]-=gtbox[:,:,2:4]*0.5
+        gtbox[:,:,2:4]+=gtbox[:,:,0:2]
+        gtbox=torch.clip(gtbox,0,1)
+        gtbox=gtbox*self.img_s
+
+        _, target_bboxes, target_scores, fg_mask, _=self.assigner.forward(
+            pd_scores=pcls.sigmoid(),
+            pd_bboxes=ptbox,
+            anc_points=anchor_points*stride,
+            gt_labels=targets[:,:,1:2],
+            gt_bboxes=gtbox,
+            mask_gt=targets[:,:,0:1],
+        )
+        target_scores_sum = max(target_scores.sum(), 1)
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = bbox_iou(ptbox[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        iou_loss = ((1.0 - iou) * weight).sum() / target_scores_sum
+        cls_loss =self.bce(pcls, target_scores).sum() / target_scores_sum  # BCE
+
+        if self.reg_max>1:
+            gtbox=target_bboxes/stride
+            x1y1, x2y2 = gtbox.chunk(2, -1)
+            gtbox_ltrb=torch.cat((anchor_points - x1y1, x2y2 - anchor_points), -1).clamp_(0, (self.reg_max - 1) * self.reg_scale - 0.001) / self.reg_scale  # dist (lt, rb)
+            dfl_loss = self._df_loss(ptbox_dist[fg_mask], gtbox_ltrb[fg_mask]) * weight
+            dfl_loss = dfl_loss.sum() / target_scores_sum
+
+        iou_loss *=7.5
+        cls_loss *= 0.5
+        dfl_loss*=1.5
+        loss=iou_loss+cls_loss+dfl_loss
+        return iou_loss, obj_loss, cls_loss, dfl_loss, loss
+
 
     def forward(self, preds, targets):
 
         if isinstance(preds, list):
             iou, obj, cls, dfl, total = [], [], [], [], []
             for p in preds:
-                iou_, obj_, cls_, dfl_, total_ = self.forward_(p, targets)
+                iou_, obj_, cls_, dfl_, total_ = self.fwd(p, targets)
                 iou.append(iou_)
                 obj.append(obj_)
                 cls.append(cls_)
@@ -179,48 +257,8 @@ class v10DetectorLoss(DetectorLoss):
             return sum(iou) / len(preds), sum(obj) / len(preds), sum(cls) / len(preds), sum(dfl) / len(preds), sum(
                 total) / len(preds)
         else:
-            return self.forward_(preds, targets)
+            return self.fwd(preds, targets)
 
-    def build_target(self, preds, targets):
-        if isinstance(preds, torch.Tensor):
-            N, C, H, W = preds.shape
-            preds_shape = preds.shape
-        else:
-            N, C, H, W = preds
-            preds_shape = preds
-        # batch存在标注的数据
-        gt_box, gt_cls, ps_index = [], [], []
-        # 每个网格的四个顶点为box中心点会归的基准点
-        quadrant = torch.tensor([[0, 0], [1, 0],
-                                 [0, 1], [1, 1]], device=self.device)
-
-        if targets.shape[0] > 0:
-            # 将坐标映射到特征图尺度上
-            scale = torch.ones(6).to(self.device)
-            scale[2:] = torch.tensor(preds_shape)[[3, 2, 3, 2]]
-            gt = targets * scale
-
-            # 扩展维度复制数据
-            gt = gt.repeat(4, 1, 1)
-
-            # 过滤越界坐标
-            quadrant = quadrant.repeat(gt.size(1), 1, 1).permute(1, 0, 2)
-            gij = gt[..., 2:4].long() + quadrant
-            j = torch.where(gij < H, gij, 0).min(dim=-1)[0] > 0
-
-            # 前景的位置下标
-            gi, gj = gij[j].T
-            batch_index = gt[..., 0].long()[j]
-            ps_index.append((batch_index, gi, gj))
-
-            # 前景的box
-            gbox = gt[..., 2:][j]
-            gt_box.append(gbox)
-
-            # 前景的类别
-            gt_cls.append(gt[..., 1].long()[j])
-
-        return gt_box, gt_cls, ps_index
 
     def forward_(self, preds, targets):
         # 初始化loss值
@@ -243,7 +281,7 @@ class v10DetectorLoss(DetectorLoss):
         # 检测框回归分支
         preg = pred[:, :, :, 1:(1 + 4 * self.reg_max)]
         # 目标类别分类分支
-        pcls = pred[:, :, :, (1 + 4 * self.reg_max):]
+        pcls = pred[:, :, :, (1 + 4 * self.reg_max):].softmax(3)
 
         N, H, W, C = pred.shape
         tobj = torch.zeros_like(pobj)
@@ -260,11 +298,7 @@ class v10DetectorLoss(DetectorLoss):
                 ptbox[:, 2] = pred_distri[:, 2].sigmoid() * W
                 ptbox[:, 3] = pred_distri[:, 3].sigmoid() * H
             else:
-                pred_ltrb = pred_distri.view(-1, 4, self.reg_max).softmax(2).matmul(self.proj.type(preg.dtype))
-                # x1 = gx - pred_dis[:, 0] / 2
-                # y1 = gy - pred_dis[:, 1] / 2
-                # x2 = gx + pred_dis[:, 2] / 2
-                # y2 = gy + pred_dis[:, 3] / 2
+                pred_ltrb = pred_distri.view(-1, 4, self.reg_max).softmax(2).matmul(self.proj)
                 ptbox[:, 0] = gx + (pred_ltrb[:, 2] - pred_ltrb[:, 0]) * self.reg_scale * 0.5
                 ptbox[:, 1] = gy + (pred_ltrb[:, 3] - pred_ltrb[:, 1]) * self.reg_scale * 0.5
                 ptbox[:, 2] = (pred_ltrb[:, 2] + pred_ltrb[:, 0]) * self.reg_scale
@@ -281,7 +315,6 @@ class v10DetectorLoss(DetectorLoss):
             gt_cls[0]=gt_cls[0][f]
 
             if self.reg_max>1:
-                gt_box[0] = gt_box[0]
                 gt_box[0] = torch.cat((gx[:, None] - gt_box[0][:, 0:1] + gt_box[0][:, 2:3] / 2,
                                   gy[:, None] - gt_box[0][:, 1:2] + gt_box[0][:, 3:4] / 2,
                                   gt_box[0][:, 0:1] + gt_box[0][:, 2:3] / 2 - gx[:, None],
@@ -289,14 +322,11 @@ class v10DetectorLoss(DetectorLoss):
                                   ), -1).clamp_(0, (
                         self.reg_max - 1) * self.reg_scale - 0.001) / self.reg_scale  # dist (lt, rb)
 
-                dfl_loss = self._df_loss(pred_distri.view(-1, self.reg_max), gt_box[0])
+                dfl_loss = self._df_loss(pred_distri, gt_box[0])
                 dfl_loss = dfl_loss.mean()
 
             # 计算iou loss
-
             iou_loss = (1.0 - iou).mean()
-            # iouw=iou.detach().softmax(0)
-            # iou_loss = ((1.0 - iou) * iouw).sum()
 
             # 计算目标类别分类分支loss
             ps = torch.log(pcls[b, gy, gx])
@@ -328,6 +358,6 @@ class v10DetectorLoss(DetectorLoss):
         wl = tr - target  # weight left
         wr = 1 - wl  # weight right
         return (
-                F.cross_entropy(pred_dist, tl.view(-1), reduction="none").view(tl.shape) * wl
-                + F.cross_entropy(pred_dist, tr.view(-1), reduction="none").view(tl.shape) * wr
+                F.cross_entropy(pred_dist.view(-1,self.reg_max), tl.view(-1), reduction="none").view(tl.shape) * wl
+                + F.cross_entropy(pred_dist.view(-1,self.reg_max), tr.view(-1), reduction="none").view(tl.shape) * wr
         ).mean(-1, keepdim=True)

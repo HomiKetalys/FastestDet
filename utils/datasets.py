@@ -53,6 +53,17 @@ def random_narrow(image, boxes):
 
     return background, output
 
+def collate_fnt(batch):
+    img, label = zip(*batch)
+    max_len=max([len(lb) for lb in label])
+    gts=[]
+    for i, l in enumerate(label):
+        gt=torch.zeros((max_len,6))
+        if len(l)>0:
+            gt[:len(l),:]=l
+        gts.append(gt)
+    return torch.stack(img), torch.stack(gts, 0)
+
 def collate_fn(batch):
     img, label = zip(*batch)
     for i, l in enumerate(label):
@@ -88,6 +99,7 @@ class TensorDataset():
                             # img = cv2.imread(data_path)
                             self.data_list.append((data_path, label_path))
                         else:
+
                             # if not self.aug:
                             #     label_flag="coco_80"
                             label_path=label_path.replace("images",label_flag)
@@ -109,7 +121,7 @@ class TensorDataset():
             with open(label_path, 'r') as f:
                 for line in f.readlines():
                     l = line.strip().split(" ")
-                    label.append([0, l[0], l[1], l[2], l[3], l[4]])
+                    label.append([1, l[0], l[1], l[2], l[3], l[4]])
             label = np.array(label, dtype=np.float32)
 
             if label.shape[0]:
@@ -125,12 +137,6 @@ class TensorDataset():
                 img = cv2.imread(img_path_c)
             else:
                 img = cv2.imread(img_path)
-                # 是否进行数据增强
-                if self.aug :
-                    if random.randint(1, 10) % 2 == 0:
-                        img, label = random_narrow(img, label)
-                    else:
-                        img, label = random_crop(img, label)
                 img = cv2.resize(img, (self.img_width, self.img_height), interpolation=cv2.INTER_LINEAR)
                 cv2.imwrite(img_path_c, img)
         else:

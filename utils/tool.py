@@ -31,12 +31,13 @@ class LoadYaml:
 
         self.category_num = data["MODEL"]["NC"]
 
-        self.amp=data["TRAIN"]["AMP"]
+        self.amp = data["TRAIN"]["AMP"]
 
-        self.conf=data["VAL"]["CONF"]
-        self.nms=data["VAL"]["NMS"]
-        self.iou=data["VAL"]["IOU"]
-        self.label_flag=os.path.splitext(os.path.split(path)[1])[0]
+        self.conf = data["VAL"]["CONF"]
+        self.nms = data["VAL"]["NMS"]
+        self.iou = data["VAL"]["IOU"]
+        self.label_flag = os.path.splitext(os.path.split(path)[1])[0]
+        self.use_taa=data["TRAIN"]["USE_TAA"]
 
         print("Load yaml sucess...")
 
@@ -147,8 +148,8 @@ class EMA():
 
 
 # 后处理(归一化后的坐标)
-def handle_preds_(preds, device, cfg=None,norm=True):
-    total_bboxes  = []
+def handle_preds_(preds, device, cfg=None, norm=True):
+    total_bboxes = []
     # 将特征图转换为检测框的坐标
     N, C, H, W = preds.shape
     bboxes = torch.zeros((N, H, W, 6))
@@ -166,13 +167,20 @@ def handle_preds_(preds, device, cfg=None,norm=True):
     # 目标类别分类分支
     pcls = pred[:, :, :, (1 + 4 * reg_max):]
 
-    # 检测框置信度
-    if pcls.shape[3]>0:
-        bboxes[..., 4] = (pobj.squeeze(-1) ** 0.6) * (pcls.max(dim=-1)[0] ** 0.4)
+    if cfg.use_taa:
+        offset = 0.5
+        pcls = pcls.sigmoid()
+        bboxes[..., 4] = (pcls.max(dim=-1)[0])
         bboxes[..., 5] = pcls.argmax(dim=-1)
     else:
-        bboxes[..., 4] = pobj.squeeze(-1)**0.6
-        bboxes[..., 5] = 0
+        offset = 0
+        if pcls.shape[3] > 0:
+            pcls = pcls.softmax(3)
+            bboxes[..., 4] = pobj.squeeze(-1) *pcls.max(dim=-1)[0]
+            bboxes[..., 5] = pcls.argmax(dim=-1)
+        else:
+            bboxes[..., 4] = pobj.squeeze(-1)
+            bboxes[..., 5] = 0
 
 
     # 检测框的坐标
@@ -180,12 +188,12 @@ def handle_preds_(preds, device, cfg=None,norm=True):
     if reg_max == 1:
         if norm:
             bw, bh = preg[..., 2].sigmoid(), preg[..., 3].sigmoid()
-            bcx = (preg[..., 0].tanh() + gx) / W
-            bcy = (preg[..., 1].tanh() + gy) / H
+            bcx = (preg[..., 0].tanh() + gx + offset) / W
+            bcy = (preg[..., 1].tanh() + gy + offset) / H
         else:
             bw, bh = preg[..., 2], preg[..., 3]
-            bcx = (preg[..., 0] + gx) / W
-            bcy = (preg[..., 1] + gy) / H
+            bcx = (preg[..., 0]  + gx + offset) / W
+            bcy = (preg[..., 1]  + gy + offset) / H
 
         # cx,cy,w,h = > x1,y1,x2,y1
         x1, y1 = bcx - 0.5 * bw, bcy - 0.5 * bh
@@ -195,11 +203,11 @@ def handle_preds_(preds, device, cfg=None,norm=True):
         proj = torch.arange(reg_max, dtype=torch.float, device=device)
         if norm:
             pred_distri = pred_distri.softmax(4)
-        pred_ltrb=pred_distri.matmul(proj.type(preg.dtype))
-        x1 = (gx - pred_ltrb[..., 0] * reg_scale) / W
-        y1 = (gy - pred_ltrb[..., 1] * reg_scale) / H
-        x2 = (gx + pred_ltrb[..., 2] * reg_scale) / W
-        y2 = (gy + pred_ltrb[..., 3] * reg_scale) / H
+        pred_ltrb = pred_distri.matmul(proj.type(preg.dtype))
+        x1 = (gx + offset - pred_ltrb[..., 0] * reg_scale) / W
+        y1 = (gy + offset - pred_ltrb[..., 1] * reg_scale) / H
+        x2 = (gx + offset + pred_ltrb[..., 2] * reg_scale) / W
+        y2 = (gy + offset + pred_ltrb[..., 3] * reg_scale) / H
 
     bboxes[..., 0], bboxes[..., 1] = x1, y1
     bboxes[..., 2], bboxes[..., 3] = x2, y2
@@ -209,17 +217,18 @@ def handle_preds_(preds, device, cfg=None,norm=True):
     batch_bboxes = torch.cat(total_bboxes, 1)
     return batch_bboxes
 
-def handle_preds(preds, device, conf_thresh=0.25, nms_thresh=0.5, cfg=None,norm=True):
-    output_bboxes=[]
-    if isinstance(preds,list):
+
+def handle_preds(preds, device, conf_thresh=0.25, nms_thresh=0.5, cfg=None, norm=True):
+    output_bboxes = []
+    if isinstance(preds, list):
         batch_bboxes = []
         for p in preds:
-            batch_bboxes.append(handle_preds_(p,device,cfg,norm))
-        batch_bboxes=torch.cat(batch_bboxes,1)
+            batch_bboxes.append(handle_preds_(p, device, cfg, norm))
+        batch_bboxes = torch.cat(batch_bboxes, 1)
     else:
-        batch_bboxes=handle_preds_(preds,device,cfg,norm)
+        batch_bboxes = handle_preds_(preds, device, cfg, norm)
     if cfg is not None:
-        nms_thresh=cfg.nms
+        nms_thresh = cfg.nms
     # 对检测框进行NMS处理
     for p in batch_bboxes:
         output, temp = [], []
