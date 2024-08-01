@@ -102,7 +102,9 @@ class TensorDataset():
 
                             # if not self.aug:
                             #     label_flag="coco_80"
-                            label_path=label_path.replace("images",label_flag)
+                            label_path=os.path.relpath(label_path,os.path.split(self.path)[0])
+                            label_path=os.path.join(os.path.split(self.path)[0],label_flag,os.path.join(*label_path.split(os.path.sep)[1:]))
+                            # label_path=label_path.replace("images",label_flag)
                             if os.path.exists(label_path):
                                 # img = cv2.imread(data_path)
                                 self.data_list.append((data_path, label_path))
