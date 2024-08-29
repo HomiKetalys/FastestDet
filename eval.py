@@ -19,11 +19,11 @@ if __name__ == '__main__':
     parser.add_argument('--weight', type=str, default=None, help='.weight config')
 
     opt = parser.parse_args()
-    assert os.path.exists(opt.yaml), "请指定正确的配置文件路径"
+    assert os.path.exists(opt.config), "请指定正确的配置文件路径"
     assert os.path.exists(opt.weight), "请指定正确的权重文件路径"
 
     # 解析yaml配置文件
-    cfg = LoadYaml(opt.yaml)    
+    cfg = LoadYaml(opt.config)
     print(cfg) 
 
     # 加载模型权重
